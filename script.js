@@ -240,30 +240,47 @@ function renderParts(products) {
  selectParts(firstAvailable);
 }
 
+let categoryOpenRequest = 0;
+
+// Start the request while the visitor is viewing the home page.
+// A failed preload is retried by the next category click.
+loadCatalog().catch(() => {});
+
 for (const category of categories) {
  async function open() {
-  if (categories.some(item => item.hasAttribute('aria-busy'))) return;
+  const requestId = ++categoryOpenRequest;
   const title = category.querySelector('h3').textContent;
-  category.setAttribute('aria-busy', 'true');
+  catalogDialog.querySelector('h2').textContent = title;
+  const loading = element('p', 'catalog-loading', 'Загружаем товары…');
+  loading.setAttribute('role', 'status');
+  loading.style.cssText = 'padding:32px 16px;text-align:center;grid-column:1/-1';
+  catalogList.replaceChildren(loading);
+  catalogList.setAttribute('aria-busy', 'true');
+  if (!catalogDialog.open) catalogDialog.showModal();
+  catalogDialog.scrollTop = 0;
   try {
    const products = (await loadCatalog()).filter(product => product.category === title);
+   if (requestId !== categoryOpenRequest || !catalogDialog.open) return;
    if (!products.length) {
+    catalogDialog.close();
     showMessage(title, 'Товара нет в наличии');
    } else if (category.id === 'parts-open') {
     renderParts(products);
+    catalogDialog.close();
     partsDialog.showModal();
     partsDialog.scrollTop = 0;
    } else {
     catalogDialog.querySelector('h2').textContent = title;
     catalogList.replaceChildren(...products.map(renderCard));
-    catalogDialog.showModal();
     catalogDialog.scrollTop = 0;
    }
   } catch (error) {
    console.error('MARGRASS: ошибка загрузки каталога', error);
+   if (requestId !== categoryOpenRequest || !catalogDialog.open) return;
+   catalogDialog.close();
    showMessage(title, 'Не удалось загрузить каталог. Попробуйте открыть категорию ещё раз.');
   } finally {
-   category.removeAttribute('aria-busy');
+   if (requestId === categoryOpenRequest) catalogList.removeAttribute('aria-busy');
   }
  }
  category.addEventListener('click', open);
