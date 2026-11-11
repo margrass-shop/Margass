@@ -45,7 +45,7 @@ function readProducts(csv) {
   if (entry.Показывать.toLowerCase() !== 'да') continue;
   const id = entry.Артикул;
   const category = entry.Категория;
-  const subcategory = entry.Подкатегория || 'Прочие запчасти и аксессуары';
+  const subcategory = entry.Подкатегория; // Keep empty cells empty; the parts UI handles its own fallback group.
   const name = entry.Название;
   const price = Number(entry.Цена.replace(/[\s₽]/g, '').replace(',', '.'));
   if (!id || !name || !entry.Цена || !Number.isFinite(price) || price < 0 ||
@@ -91,7 +91,7 @@ function element(tag, className, content) {
  return node;
 }
 
-function renderCard(product) {
+function renderCard(product, initialVariant = 0) {
  const hasOptions = Boolean(product.variants[0].label);
  const isTire = product.category === 'Запчасти' && product.subcategory === 'Покрышки';
  const card = element('article', 'product-card');
@@ -197,7 +197,7 @@ function renderCard(product) {
   button.onclick = () => selectVariant(variant, button);
   options.append(button);
  }
- selectVariant(product.variants[0], options.firstElementChild);
+ selectVariant(product.variants[initialVariant] || product.variants[0], options.children[initialVariant] || options.firstElementChild);
  return card;
 }
 
@@ -231,7 +231,7 @@ function renderParts(products) {
   if (items.length) {
    firstAvailable ??= button;
    const list = element('div', 'product-list');
-   list.append(...items.map(renderCard));
+   list.append(...items.map(product => renderCard(product)));
    panel.replaceChildren(list);
   } else {
    panel.replaceChildren(element('h3', '', button.textContent.trim()), element('p', '', 'Товара нет в наличии'));
@@ -271,7 +271,7 @@ for (const category of categories) {
     partsDialog.scrollTop = 0;
    } else {
     catalogDialog.querySelector('h2').textContent = title;
-    catalogList.replaceChildren(...products.map(renderCard));
+    catalogList.replaceChildren(...products.map(product => renderCard(product)));
     catalogDialog.scrollTop = 0;
    }
   } catch (error) {
@@ -301,3 +301,177 @@ for (const modal of [catalogDialog, partsDialog, emptyDialog]) {
       event.clientY < bounds.top || event.clientY > bounds.bottom) modal.close();
  });
 }
+
+// Search uses the same current, visible catalogue as the category windows.
+function normalizeSearch(value) {
+ return String(value).toLocaleLowerCase('ru-RU').replace(/ё/g, 'е');
+}
+function findCatalogMatches(products, query) {
+ const term = normalizeSearch(query.trim());
+ if (!term) return [];
+ const byName = [], bySpecs = [], byCategory = [];
+ for (const product of products) {
+  if (normalizeSearch(product.name).includes(term)) {
+   byName.push({product, variantIndex: 0, source: 'name'});
+   continue;
+  }
+  const categoryFields = [product.category, product.subcategory, product.type];
+  if (categoryFields.some(value => value && normalizeSearch(value).includes(term))) {
+   byCategory.push({product, variantIndex: 0, source: 'category'});
+   continue;
+  }
+  const variantIndex = product.variants.findIndex(variant =>
+   variant.specs.some(line => normalizeSearch(line).includes(term)) ||
+   normalizeSearch(variant.label).includes(term));
+  if (variantIndex !== -1) {
+   const variant = product.variants[variantIndex];
+   const snippet = variant.specs.find(line => normalizeSearch(line).includes(term)) || 'Вариант: ' + variant.label;
+   bySpecs.push({product, variantIndex, source: 'specs', snippet});
+  }
+ }
+ return [...byName, ...byCategory, ...bySpecs];
+}
+function appendSearchHighlight(parent, text, query) {
+ const term = normalizeSearch(query.trim());
+ const normalized = normalizeSearch(text);
+ let offset = 0, index;
+ while (term && (index = normalized.indexOf(term, offset)) !== -1) {
+  parent.append(document.createTextNode(text.slice(offset, index)));
+  parent.append(element('mark', '', text.slice(index, index + term.length)));
+  offset = index + term.length;
+ }
+ parent.append(document.createTextNode(text.slice(offset)));
+}
+function initCatalogSearch() {
+ const root = document.querySelector('#catalog-search');
+ if (!root) return;
+ const trigger = root.querySelector('#catalog-search-trigger');
+ const panel = root.querySelector('#catalog-search-panel');
+ const input = root.querySelector('#catalog-search-input');
+ const clear = root.querySelector('#catalog-search-clear');
+ const close = root.querySelector('#catalog-search-close');
+ const results = root.querySelector('#catalog-search-results');
+ const status = root.querySelector('#catalog-search-status');
+ const hint = root.querySelector('.catalog-search-hint');
+ let updateId = 0;
+ let openingSearch = false;
+ function dismissResults() { ++updateId; results.hidden = true; status.textContent = ''; }
+ function collapse(restoreFocus = false) {
+  dismissResults(); animateSearchWidth(false); root.classList.remove('is-open'); panel.inert = true;
+  trigger.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) trigger.focus();
+ }
+ function openResult(match) {
+  // Invalidate an unfinished category opening before displaying the chosen item.
+  ++categoryOpenRequest;
+  const {product, variantIndex} = match;
+  catalogDialog.querySelector('h2').textContent = product.category;
+  catalogList.removeAttribute('aria-busy');
+  catalogList.replaceChildren(renderCard(product, variantIndex));
+  if (!catalogDialog.open) catalogDialog.showModal();
+  catalogDialog.scrollTop = 0;
+  dismissResults();
+ }
+ async function update() {
+  const id = ++updateId;
+  const query = input.value.trim();
+  clear.hidden = !input.value;
+  hint.hidden = false;
+  results.replaceChildren(); results.hidden = true;
+  if (!query) { status.textContent = ''; return; }
+  status.textContent = 'Ищем товары…';
+  try {
+   const products = await loadCatalog();
+   if (id !== updateId || !root.classList.contains('is-open')) return;
+   const matches = findCatalogMatches(products, query);
+   status.textContent = matches.length ? 'Найдено товаров: ' + matches.length : 'Ничего не найдено. Попробуйте другое название или характеристику.';
+   let previousSource;
+   for (const match of matches) {
+    if (match.source !== previousSource) {
+     results.append(element('h3', 'catalog-search-group', ({name: 'Совпадения в названии', specs: 'Совпадения в характеристиках', category: 'Совпадения в категории'})[match.source]));
+     previousSource = match.source;
+    }
+    const {product, variantIndex} = match;
+    const variant = product.variants[variantIndex];
+    const button = element('button', 'catalog-search-result'); button.type = 'button';
+    if (variant.photos[0]) {
+     const image = element('img'); image.src = variant.photos[0]; image.alt = ''; image.loading = 'lazy';
+     button.append(image);
+    }
+    const info = element('span', 'catalog-search-result-info');
+    const name = element('span', 'catalog-search-result-name');
+    appendSearchHighlight(name, product.name, query);
+    const categoryText = element('span', 'catalog-search-result-meta');
+    const matchedCategory = match.source === 'category' ? [product.subcategory, product.type].find(value => value && normalizeSearch(value).includes(normalizeSearch(query))) : '';
+    const categoryLabel = matchedCategory && matchedCategory !== product.category ? product.category + ' · ' + matchedCategory : product.category;
+    appendSearchHighlight(categoryText, categoryLabel, query);
+    info.append(name, categoryText);
+    if (match.snippet) {
+     const snippet = element('span', 'catalog-search-result-spec');
+     appendSearchHighlight(snippet, match.snippet, query); info.append(snippet);
+    }
+    const minPrice = Math.min(...product.variants.map(option => option.price));
+    const variedPrices = product.variants.some(option => option.price !== minPrice);
+    const priceText = match.source !== 'specs' ? (variedPrices ? 'от ' : '') + priceFormat.format(minPrice) : priceFormat.format(variant.price);
+    button.append(info, element('span', 'catalog-search-result-price', priceText + ' ₽'));
+    button.addEventListener('click', () => openResult(match));
+    results.append(button);
+   }
+   results.hidden = !matches.length;
+   results.scrollTop = 0;
+  } catch (error) {
+   if (id !== updateId) return;
+   status.textContent = 'Не удалось загрузить товары. Измените запрос, чтобы повторить поиск.';
+  }
+ }
+ const header = root.closest('.catalog-section-head');
+ function animateSearchWidth(expanded) {
+  const current = root.getBoundingClientRect().width;
+  const target = parseFloat(root.style.getPropertyValue(expanded ? '--search-expanded-width' : '--search-collapsed-width'));
+  if (!Number.isFinite(target)) return;
+  root.style.width = current + 'px';
+  // Commit the current size before changing the target, in both directions.
+  void root.offsetWidth;
+  root.style.width = target + 'px';
+ }
+ function measureSearchWidth() {
+  if (!header) return;
+  const mobile = window.matchMedia('(max-width: 900px)').matches;
+  const gap = parseFloat(getComputedStyle(header).columnGap) || 24;
+  const available = mobile ? header.clientWidth : header.clientWidth - header.firstElementChild.getBoundingClientRect().width - gap;
+  root.style.setProperty('--search-expanded-width', Math.max(0, available) + 'px');
+  root.style.setProperty('--search-collapsed-width', Math.min(238, Math.max(0, available)) + 'px');
+ }
+ measureSearchWidth();
+ if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measureSearchWidth).observe(header || root.parentElement);
+ else window.addEventListener('resize', measureSearchWidth);
+ trigger.addEventListener('click', () => {
+  measureSearchWidth(); animateSearchWidth(true); root.classList.add('is-open'); panel.inert = false;
+  openingSearch = true;
+  trigger.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+   if (root.classList.contains('is-open')) input.focus({preventScroll: true});
+   openingSearch = false;
+  });
+  update();
+ });
+ input.addEventListener('input', update);
+ input.addEventListener('focus', () => { if (input.value.trim()) update(); });
+ clear.addEventListener('click', () => { input.value = ''; input.focus(); update(); });
+ close.addEventListener('click', () => collapse(true));
+ root.addEventListener('keydown', event => {
+  if (event.key === 'Escape') { event.preventDefault(); collapse(true); }
+  if (event.key === 'ArrowDown' && event.target === input && !results.hidden) {
+   event.preventDefault(); results.querySelector('button')?.focus();
+  }
+  if (event.target.classList.contains('catalog-search-result')) {
+   const buttons = [...results.querySelectorAll('button')];
+   const index = buttons.indexOf(event.target);
+   if (event.key === 'ArrowDown') { event.preventDefault(); buttons[Math.min(index + 1, buttons.length - 1)]?.focus(); }
+   if (event.key === 'ArrowUp') { event.preventDefault(); if (!index) input.focus(); else buttons[index - 1].focus(); }
+  }
+ });
+ document.addEventListener('click', event => { if (!root.contains(event.target)) collapse(); });
+ document.addEventListener('focusin', event => { if (!openingSearch && !root.contains(event.target)) collapse(); });
+}
+initCatalogSearch();
